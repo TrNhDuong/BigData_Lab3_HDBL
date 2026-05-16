@@ -15,24 +15,27 @@ For each SKU within each month, compute the **standard deviation** of the amount
 
 ## How to Run
 
-### Option A: Local mode with `spark-submit`
-```bash
-# 1. Build fat JAR
-cd src/Task2-2
-sbt assembly
+You **do not** need to install Apache Spark manually. `sbt` will automatically download the required Spark libraries based on the `build.sbt` file. Windows environment issues (such as `hadoop.dll`) have also been handled in the project configuration.
 
-# 2. Submit to Spark
-spark-submit \
-  --class Task22 \
-  --master local[*] \
-  target/scala-2.12/Task2-2-assembly-1.0.jar \
-  "path/to/Amazon Sale Report.csv"
+### Option A: Run directly with `sbt run` (Recommended)
+By default, the script is configured to read the dataset from `../../data/data.csv`. Simply open your terminal and execute:
+```bash
+cd src/Task2-2
+sbt run
 ```
 
-### Option B: Run directly with `sbt run`
+### Option B: Run with a custom dataset path
+If your dataset is located elsewhere, you can pass the path as an argument:
 ```bash
 cd src/Task2-2
-sbt "run \"path/to/Amazon Sale Report.csv\""
+sbt "run /path/to/your/dataset.csv"
+```
+
+### Option C: Build and submit via `spark-submit`
+```bash
+cd src/Task2-2
+sbt assembly
+spark-submit --class Task22 --master local[*] target/scala-2.12/Task2-2-assembly-1.0.jar
 ```
 
 ---
