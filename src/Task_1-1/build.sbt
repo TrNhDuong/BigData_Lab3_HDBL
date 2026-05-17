@@ -19,3 +19,6 @@ assembly / assemblyMergeStrategy := {
 // Main class
 Compile / mainClass := Some("Task1_1Driver")
 assembly / mainClass := Some("Task1_1Driver")
+
+// Configure SBT to find source files in the 'source' directory
+Compile / scalaSource := baseDirectory.value / "source"
