@@ -26,7 +26,8 @@ javaOptions ++= Seq(
   "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
   "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
   "-Djdk.security.allowNonSubjectDoAs=true",
-  "-Dhadoop.home.dir=D:/BigData_Lab3_HDBL/src/Task2-2/hadoop"
+  s"-Dhadoop.home.dir=${baseDirectory.value}/hadoop",
+  s"-Djava.library.path=${baseDirectory.value}/hadoop/bin"
 )
 
 // Configure SBT to find source files in the 'source' directory

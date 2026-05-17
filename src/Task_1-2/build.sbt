@@ -31,3 +31,6 @@ assembly / assemblyMergeStrategy := {
 assembly / packageOptions += Package.ManifestAttributes(
   "Main-Class" -> "Task1_2Driver"
 )
+
+// Configure SBT to find source files in the 'source' directory
+Compile / scalaSource := baseDirectory.value / "source"

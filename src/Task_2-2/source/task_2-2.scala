@@ -10,8 +10,12 @@
  *
  * Requirements satisfied:
  *   - Scala + Spark Structured APIs only (no Spark SQL string queries)
- *   - Benchmarked over 5 runs with mean and std dev reported
+ *   - Benchmarked over 5+ runs with mean and std dev reported
  *   - explain(true) included for execution plan analysis
+ *   - Diagnostic outputs to support report sections:
+ *       * threshold accuracy comparison (approx vs exact)
+ *       * qualifying-set differences between the two approaches
+ *       * analysis of SKU-month groups containing > 1000 orders
  *   - Output: single Task_2-2.parquet under normal filesystem
  */
 
@@ -50,7 +54,7 @@ object Task22 {
     spark.sparkContext.setLogLevel("WARN")
     import spark.implicits._
 
-    val csvPath  = if (args.nonEmpty) args(0) else "Amazon Sale Report.csv"
+    val csvPath  = if (args.nonEmpty) args(0) else "../../data/data.csv"
     val outputDir  = "Task_2-2_tmp"
     val outputFile = "Task_2-2.parquet"
 
@@ -84,6 +88,8 @@ object Task22 {
     //  - cache() because this cleaned DataFrame is reused many times across
     //    both approaches and all benchmark runs.
     // -------------------------------------------------------------------------
+    val rawCount = rawDF.count()
+
     val df = rawDF
       .withColumn("parsed_date", to_date(col("Date"), "MM-dd-yy"))
       .withColumn("year",  year(col("parsed_date")))
@@ -95,6 +101,10 @@ object Task22 {
       .withColumn("Amount", col("Amount").cast("double"))
       .filter(col("parsed_date").isNotNull && col("SKU").isNotNull && col("Amount").isNotNull)
       .cache()
+
+    val cleanCount = df.count()
+    println(s"[INFO] Loaded $rawCount rows, kept $cleanCount after cleaning " +
+            s"(dropped ${rawCount - cleanCount} rows with null date/SKU/Amount).")
 
     // -------------------------------------------------------------------------
     // 3. Helper: computeStd
@@ -145,11 +155,17 @@ object Task22 {
     // without it, Spark's lazy evaluation means nothing runs yet.
     // File I/O is intentionally excluded from timing — we want to measure
     // the computational cost of the percentile + stddev logic only.
+    //
+    // We also expose the last run's threshold DataFrames (threshApproxFinal,
+    // threshExactFinal) so the diagnostic section below can analyze them
+    // without recomputing.
     // -------------------------------------------------------------------------
     val numRuns   = 9
     val timesApprox = new scala.collection.mutable.ArrayBuffer[Long]()
     val timesExact  = new scala.collection.mutable.ArrayBuffer[Long]()
     var finalResultDF: org.apache.spark.sql.DataFrame = null
+    var threshApproxFinal: org.apache.spark.sql.DataFrame = null
+    var threshExactFinal:  org.apache.spark.sql.DataFrame = null
 
     for (run <- 1 to numRuns) {
       println(s"[Trial $run/$numRuns] Computing thresholds and statistics...")
@@ -199,6 +215,8 @@ object Task22 {
       //
       // To find the P90 threshold we take the minimum promo_count value whose
       // cume_dist is >= 0.90 — this is the exact lower bound of the top 10%.
+      // This is the standard "nearest-rank / inverse-CDF" definition of
+      // percentile and matches NumPy's "lower" interpolation method.
       //
       // This is exact (no approximation) but requires a full sort per partition,
       // making it more expensive than percentile_approx on large groups.
@@ -230,7 +248,8 @@ object Task22 {
       exactResult.count() // trigger execution
       timesExact += (System.currentTimeMillis() - t2Start)
 
-      // On the last run, print execution plans and build the final merged result.
+      // On the last run, print execution plans, build the final merged result,
+      // and expose the threshold DataFrames for the diagnostic analysis below.
       // explain(true) shows the full physical plan including join strategies,
       // Exchange (shuffle) nodes, and stage boundaries — required for the report.
       if (run == numRuns) {
@@ -254,6 +273,11 @@ object Task22 {
             col("std_p90_exact"),
             col("std_p80_exact")
           )
+
+        // Save threshold DataFrames so the diagnostic section can reuse them
+        // without recomputing the percentile_approx / cume_dist work.
+        threshApproxFinal = threshApprox
+        threshExactFinal  = threshExact
       }
     }
 
@@ -279,8 +303,218 @@ object Task22 {
     println(f"Exact Percentile : Mean = $m2%10.2f ms | StdDev = $s2%10.2f ms")
     println("=" * 70)
 
+    // =========================================================================
+    // 6. DIAGNOSTIC ANALYSIS FOR REPORT
+    //
+    // The lab report explicitly requires three pieces of analysis that are not
+    // visible from the final parquet output alone:
+    //
+    //   (a) Accuracy: how do approx and exact thresholds differ?
+    //   (b) Qualifying-set differences: which SKU-month groups produce
+    //       different sets of qualifying orders under the two approaches?
+    //   (c) Large groups: are there any SKU-month groups with > 1000 orders,
+    //       and what would the partitioning implications be?
+    //
+    // We compute all three here, AFTER the benchmark, so they do not pollute
+    // the timing measurements. Numbers are printed to console — the user can
+    // copy them into the report directly.
+    // =========================================================================
+
+    println("\n" + "=" * 70)
+    println("DIAGNOSTIC ANALYSIS (for report)")
+    println("=" * 70)
+
     // -------------------------------------------------------------------------
-    // 6. Export result
+    // 6.1 Threshold accuracy comparison (Approach A vs Approach B)
+    //
+    // We join the two threshold DataFrames on (SKU, year, month) and compute
+    // the per-group difference (approx - exact). Useful summary statistics:
+    //   - count of groups with diff != 0          → how often they disagree
+    //   - mean / max absolute difference          → magnitude of disagreement
+    //   - distribution of disagreement (>0 vs <0) → bias direction
+    //
+    // Note: percentile_approx returns a Long here because promo_count is Long.
+    // cume_dist's threshold is also Long. Cast to Double before subtracting
+    // just to be safe against any future schema changes.
+    // -------------------------------------------------------------------------
+    println("\n[6.1] Threshold accuracy comparison")
+    println("-" * 70)
+
+    val threshCompare = threshApproxFinal
+      .join(threshExactFinal, Seq("SKU", "year", "month"), "inner")
+      .withColumn("diff_p90", col("p90_thresh").cast("double") - col("p90_thresh_exact").cast("double"))
+      .withColumn("diff_p80", col("p80_thresh").cast("double") - col("p80_thresh_exact").cast("double"))
+      .cache()
+
+    val totalGroups = threshCompare.count()
+    val diffP90Cnt  = threshCompare.filter(col("diff_p90") =!= 0).count()
+    val diffP80Cnt  = threshCompare.filter(col("diff_p80") =!= 0).count()
+
+    println(f"Total SKU-month groups            : $totalGroups")
+    println(f"Groups where P90 thresholds differ: $diffP90Cnt%d  (${100.0 * diffP90Cnt / totalGroups}%.2f%%)")
+    println(f"Groups where P80 thresholds differ: $diffP80Cnt%d  (${100.0 * diffP80Cnt / totalGroups}%.2f%%)")
+
+    // Aggregate statistics on the magnitude of disagreement.
+    // We use abs(diff) so positive and negative gaps don't cancel each other.
+    val diffStats = threshCompare.agg(
+      avg(abs(col("diff_p90"))).alias("mean_abs_diff_p90"),
+      max(abs(col("diff_p90"))).alias("max_abs_diff_p90"),
+      avg(abs(col("diff_p80"))).alias("mean_abs_diff_p80"),
+      max(abs(col("diff_p80"))).alias("max_abs_diff_p80")
+    )
+    println("\nMagnitude of disagreement (|approx - exact|):")
+    diffStats.show(false)
+
+    // Show up to 10 concrete examples where the thresholds disagree — useful
+    // for the report to illustrate the kind of values involved.
+    println("Examples of groups with disagreement (up to 10):")
+    threshCompare
+      .filter(col("diff_p90") =!= 0 || col("diff_p80") =!= 0)
+      .select("SKU", "year", "month",
+              "p90_thresh", "p90_thresh_exact", "diff_p90",
+              "p80_thresh", "p80_thresh_exact", "diff_p80")
+      .show(10, false)
+
+    // -------------------------------------------------------------------------
+    // 6.2 Qualifying-set differences
+    //
+    // For each group we count how many orders pass the P90 filter under each
+    // approach. If the counts differ, the two approaches selected different
+    // orders → potentially different stddev values.
+    //
+    // Even when the threshold values are identical, the resulting qualifying
+    // sets must also be identical (same filter on same data), so non-zero
+    // diff in counts implies non-zero diff in thresholds. Reporting both gives
+    // the reader a concrete sense of downstream impact.
+    // -------------------------------------------------------------------------
+    println("\n[6.2] Qualifying-set differences (orders passing P90 filter)")
+    println("-" * 70)
+
+    val joinedA = df.join(threshApproxFinal, Seq("SKU", "year", "month"), "inner")
+    val joinedE = df.join(threshExactFinal,  Seq("SKU", "year", "month"), "inner")
+
+    val cntApprox = joinedA
+      .filter(col("promo_count") >= col("p90_thresh"))
+      .groupBy("SKU", "year", "month")
+      .agg(count("*").alias("n_qualified_approx"))
+
+    val cntExact = joinedE
+      .filter(col("promo_count") >= col("p90_thresh_exact"))
+      .groupBy("SKU", "year", "month")
+      .agg(count("*").alias("n_qualified_exact"))
+
+    // outer join to capture groups that have qualifying orders in one approach
+    // but zero in the other (treated as null on the missing side → fill 0).
+    val cntCompare = cntApprox
+      .join(cntExact, Seq("SKU", "year", "month"), "outer")
+      .withColumn("n_qualified_approx", coalesce(col("n_qualified_approx"), lit(0L)))
+      .withColumn("n_qualified_exact",  coalesce(col("n_qualified_exact"),  lit(0L)))
+      .withColumn("diff_count", col("n_qualified_approx") - col("n_qualified_exact"))
+      .cache()
+
+    val diffSetCnt = cntCompare.filter(col("diff_count") =!= 0).count()
+    println(f"Groups with different qualifying-set sizes (P90): $diffSetCnt%d  " +
+            f"(${100.0 * diffSetCnt / totalGroups}%.2f%% of all groups)")
+
+    println("\nExamples (up to 10):")
+    cntCompare
+      .filter(col("diff_count") =!= 0)
+      .orderBy(abs(col("diff_count")).desc)
+      .show(10, false)
+
+    // -------------------------------------------------------------------------
+    // 6.3 Large groups (> 1000 orders) — partitioning analysis
+    //
+    // The lab requires discussion of: (a) whether manual repartitioning helps,
+    // (b) chosen partition strategy, (c) how the group's data volume compares
+    // to Spark's default partition size (~128 MB).
+    //
+    // We:
+    //   1. Find all SKU-month groups with > 1000 orders.
+    //   2. Estimate per-row size in bytes (rough): integers ~ 4-8 B, strings
+    //      vary widely. For our columns (SKU, year, month, Amount,
+    //      promotion-ids, etc.) a conservative average is ~ 200 bytes per row.
+    //   3. Multiply count * 200 to estimate group volume; compare with 128 MB.
+    //
+    // The 200 B/row figure is a heuristic for the Amazon Sales dataset's
+    // typical row width; the report should note this is an estimate, not an
+    // exact measurement from Spark internals.
+    // -------------------------------------------------------------------------
+    println("\n[6.3] Large SKU-month groups (> 1000 orders)")
+    println("-" * 70)
+
+    val avgRowBytesEstimate = 200L           // rough estimate for this dataset
+    val defaultPartitionMB  = 128.0
+    val mbToBytes           = 1024.0 * 1024.0
+
+    val groupSizes = df
+      .groupBy("SKU", "year", "month")
+      .agg(count("*").alias("n_orders"))
+      .withColumn("est_size_mb",
+        col("n_orders") * lit(avgRowBytesEstimate) / lit(mbToBytes))
+      .cache()
+
+    val largeGroups = groupSizes.filter(col("n_orders") > 1000)
+    val nLarge = largeGroups.count()
+    println(f"Number of SKU-month groups with > 1000 orders: $nLarge%d")
+
+    if (nLarge > 0) {
+      println("\nLargest groups (top 20 by order count):")
+      largeGroups.orderBy(desc("n_orders")).show(20, false)
+
+      val maxSizeMB = largeGroups.agg(max(col("est_size_mb"))).first().getDouble(0)
+      println(f"Largest estimated group size: $maxSizeMB%.4f MB")
+      println(f"Spark default partition size: $defaultPartitionMB%.1f MB")
+      println(f"Ratio (largest group / default partition): ${maxSizeMB / defaultPartitionMB}%.6f")
+      println("\nInterpretation hints for the report:")
+      println("  - If ratio << 1, each group fits comfortably inside one partition.")
+      println("    Default partitioning is already efficient; manual repartition by")
+      println("    SKU would create many tiny tasks (overhead > benefit).")
+      println("  - If ratio is close to or above 1, that group would span multiple")
+      println("    partitions and benefit from repartition(col(\"SKU\")) so all rows")
+      println("    of one SKU collocate on the same task (better data locality).")
+    } else {
+      println("\nNo group exceeds the 1000-order threshold — the dataset's largest")
+      println("SKU-month groups are well below Spark's default 128 MB partition size,")
+      println("so manual repartitioning would not provide measurable benefit and")
+      println("would only add coordination overhead.")
+    }
+
+    // -------------------------------------------------------------------------
+    // 6.4 Optional: cross-check stddev values where qualifying sets differ
+    //
+    // If approx and exact picked different orders, their stddev outputs may
+    // also differ. Quick scan over the final merged DataFrame.
+    // -------------------------------------------------------------------------
+    println("\n[6.4] Final stddev differences (approx vs exact)")
+    println("-" * 70)
+    val stddevDiff = finalResultDF
+      .withColumn("diff_std_p90", abs(col("std_p90_approx") - col("std_p90_exact")))
+      .withColumn("diff_std_p80", abs(col("std_p80_approx") - col("std_p80_exact")))
+
+    // tolerance 1e-9 avoids flagging floating-point noise as a real difference
+    val tol = 1e-9
+    val diffStdP90Cnt = stddevDiff.filter(col("diff_std_p90") > tol).count()
+    val diffStdP80Cnt = stddevDiff.filter(col("diff_std_p80") > tol).count()
+    println(f"Groups with non-trivial stddev_p90 disagreement (> $tol): $diffStdP90Cnt%d")
+    println(f"Groups with non-trivial stddev_p80 disagreement (> $tol): $diffStdP80Cnt%d")
+
+    if (diffStdP90Cnt > 0 || diffStdP80Cnt > 0) {
+      println("\nTop 10 largest stddev disagreements:")
+      stddevDiff
+        .orderBy(desc("diff_std_p90"))
+        .select("SKU", "year", "month",
+                "std_p90_approx", "std_p90_exact", "diff_std_p90",
+                "std_p80_approx", "std_p80_exact", "diff_std_p80")
+        .show(10, false)
+    }
+
+    println("\n" + "=" * 70)
+    println("End of diagnostic analysis")
+    println("=" * 70)
+
+    // -------------------------------------------------------------------------
+    // 7. Export result
     //
     // coalesce(1) merges all partitions into a single output file.
     // Spark writes to a temp directory first (Hadoop convention), then we copy
@@ -310,6 +544,13 @@ object Task22 {
       case e: Exception =>
         println("[WARNING] Could not rename part file automatically: " + e.getMessage)
     }
+
+    // Free caches before stopping to keep things tidy.
+    threshCompare.unpersist()
+    cntCompare.unpersist()
+    groupSizes.unpersist()
+    allSkuMonths.unpersist()
+    df.unpersist()
 
     spark.stop()
   }
