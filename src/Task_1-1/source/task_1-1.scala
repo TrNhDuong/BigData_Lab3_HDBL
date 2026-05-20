@@ -12,16 +12,16 @@ import java.time.format.DateTimeFormatter
 import scala.collection.JavaConverters._
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Job 1 – Count purchases per (windowDate, state, size)
+// Job 1 - Sum purchased quantity per (windowDate, state, size)
 //
 // Mapper:
 //   Input : one CSV row
-//   Output: key = "windowDate\tstate\tsize"  value = "1"
+//   Output: key = "windowDate\tstate\tsize"  value = "qty"
 //   → emits one pair for every window date d where orderDate ∈ [d-7, d-1]
 //
 // Reducer:
-//   Input : key = "windowDate\tstate\tsize"  values = ["1","1",...]
-//   Output: key = "windowDate\tstate"        value = "size\tcount"
+//   Input : key = "windowDate\tstate\tsize"  values = ["qty","qty",...]
+//   Output: key = "windowDate\tstate"        value = "size\ttotalQty"
 // ─────────────────────────────────────────────────────────────────────────────
 object Job1_CountPurchases {
 
@@ -34,7 +34,7 @@ object Job1_CountPurchases {
     private var stateIdx  = -1
 
     private val outKey   = new Text()
-    private val outValue = new Text("1")
+    private val outValue = new Text()
 
     override def setup(context: Mapper[LongWritable, Text, Text, Text]#Context): Unit = {
       val conf  = context.getConfiguration
@@ -79,6 +79,7 @@ object Job1_CountPurchases {
       for (offset <- 1 to 7) {
         val windowDate = orderDate.plusDays(offset)
         outKey.set(s"${windowDate}\t${rawState}\t${rawSize}")
+        outValue.set(qty.toString)
         context.write(outKey, outValue)
       }
     }
@@ -98,6 +99,8 @@ object Job1_CountPurchases {
 
     private val dateFormats = List(
       DateTimeFormatter.ofPattern("M/d/yy"),
+      DateTimeFormatter.ofPattern("M-d-yy"),
+      DateTimeFormatter.ofPattern("MM-dd-yy"),
       DateTimeFormatter.ofPattern("MM-dd-yyyy"),
       DateTimeFormatter.ofPattern("yyyy-MM-dd"),
       DateTimeFormatter.ofPattern("M/d/yyyy"),
@@ -120,13 +123,15 @@ object Job1_CountPurchases {
         values: Iterable[Text],
         context: Reducer[Text, Text, Text, Text]#Context
     ): Unit = {
-      val count = values.asScala.foldLeft(0L)((acc, _) => acc + 1L)
+      val totalQty = values.asScala.foldLeft(0L) { (acc, v) =>
+        acc + (try v.toString.toLong catch { case _: Exception => 0L })
+      }
       val parts = key.toString.split("\t", -1)
       if (parts.length < 3) return
 
-      // Re-key as "windowDate\tstate" → "size\tcount"
+      // Re-key as "windowDate\tstate" -> "size\ttotalQty"
       outKey.set(s"${parts(0)}\t${parts(1)}")
-      outValue.set(s"${parts(2)}\t${count}")
+      outValue.set(s"${parts(2)}\t${totalQty}")
       context.write(outKey, outValue)
     }
   }
@@ -136,7 +141,7 @@ object Job1_CountPurchases {
 // Job 2 – Find the most bought size per (windowDate, state)
 //
 // Mapper  : identity – re-key lines from Job 1 output
-// Reducer : pick size with highest count; tie-break = lexicographic order
+// Reducer : pick size with highest total quantity; tie-break = lexicographic order
 // ─────────────────────────────────────────────────────────────────────────────
 object Job2_FindMaxSize {
 
@@ -153,7 +158,7 @@ object Job2_FindMaxSize {
       val line  = value.toString.trim
       if (line.isEmpty) return
 
-      // Job 1 output line: "windowDate\tstate\tsize\tcount"
+      // Job 1 output line: "windowDate\tstate\tsize\ttotalQty"
       val parts = line.split("\t", -1)
       if (parts.length < 4) return
 
@@ -173,24 +178,24 @@ object Job2_FindMaxSize {
         values: Iterable[Text],
         context: Reducer[Text, Text, Text, Text]#Context
     ): Unit = {
-      var bestSize  = ""
-      var bestCount = 0L
+      var bestSize = ""
+      var bestQty  = 0L
 
       for (v <- values.asScala) {
         val parts = v.toString.split("\t", -1)
         if (parts.length >= 2) {
-          val size  = parts(0)
-          val count = try parts(1).toLong catch { case _: Exception => 0L }
+          val size = parts(0)
+          val qty  = try parts(1).toLong catch { case _: Exception => 0L }
           val better =
-            count > bestCount ||
-            (count == bestCount && (bestSize.isEmpty || size < bestSize))
-          if (better) { bestSize = size; bestCount = count }
+            qty > bestQty ||
+            (qty == bestQty && (bestSize.isEmpty || size < bestSize))
+          if (better) { bestSize = size; bestQty = qty }
         }
       }
 
       if (bestSize.nonEmpty) {
-        // Output key carries all data; value is empty
-        outKey.set(s"${key.toString}\t${bestSize}\t${bestCount}")
+        // Output key carries only the final fields; quantity is used internally for ranking.
+        outKey.set(s"${key.toString}\t${bestSize}")
         context.write(outKey, outValue)
       }
     }
@@ -238,7 +243,7 @@ object Task1_1Driver {
     val fs = FileSystem.get(conf)
 
     // ── Job 1 ───────────────────────────────────────────────────────────────
-    val job1 = Job.getInstance(conf, "Task1-1 Job1: Count purchases per window-state-size")
+    val job1 = Job.getInstance(conf, "Task1-1 Job1: Sum quantity per window-state-size")
     job1.setJarByClass(Task1_1Driver.getClass)
     job1.setMapperClass(classOf[Job1_CountPurchases.PurchaseMapper])
     job1.setReducerClass(classOf[Job1_CountPurchases.CountReducer])
@@ -321,11 +326,14 @@ object Task1_1Driver {
   /** Merge HDFS part-* files into a single local CSV with a header row. */
   private def mergeToLocalCsv(conf: Configuration, hdfsDir: Path, localPath: String): Unit = {
     val fs     = FileSystem.get(conf)
+    val outFile = new java.io.File(localPath)
+    val parent = outFile.getParentFile
+    if (parent != null) parent.mkdirs()
     val writer = new java.io.PrintWriter(
-      new java.io.BufferedWriter(new java.io.FileWriter(localPath))
+      new java.io.BufferedWriter(new java.io.FileWriter(outFile))
     )
     try {
-      writer.println("window_date,state,most_bought_size,purchase_count")
+      writer.println("window_date,state,most_bought_size")
       fs.listStatus(hdfsDir)
         .filter(_.getPath.getName.startsWith("part-"))
         .sortBy(_.getPath.getName)
@@ -335,7 +343,7 @@ object Task1_1Driver {
           while (line != null) {
             val trimmed = line.trim
             if (trimmed.nonEmpty) {
-              // key = "windowDate\tstate\tmostBoughtSize\tpurchaseCount"
+              // key = "windowDate\tstate\tmostBoughtSize"
               // value field is empty → last tab-separated token is empty, drop it
               val parts  = trimmed.split("\t", -1)
               val useful = if (parts.last.isEmpty) parts.dropRight(1) else parts

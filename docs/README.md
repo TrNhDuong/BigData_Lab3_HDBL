@@ -88,13 +88,12 @@ File CSV được lưu tại thư mục local: `/output/task1-1/Task_1-1.csv`
 | `window_date`      | Date         | Ngày bắt đầu của rolling window |
 | `state`            | String       | Tên tiểu bang                   |
 | `most_bought_size` | String       | Size được mua nhiều nhất        |
-| `purchase_count`   | Int          | Số lượng mua                    |
 
 **Ví dụ:**
 
 ```
-window_date,state,most_bought_size,purchase_count
-2022-04-08,ANDHRA PRADESH,M,12
+window_date,state,most_bought_size
+2022-04-08,ANDHRA PRADESH,M
 ...
 ```
 
